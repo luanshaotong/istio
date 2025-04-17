@@ -299,6 +299,10 @@ func GatewayFilter(configs []config.Config) []config.Config {
 	return out
 }
 
+func (ps *PushContext) GetGateways() []config.Config {
+	return ps.gatewayIndex.all
+}
+
 func (ps *PushContext) GetGatewayByName(name string) *config.Config {
 	parts := strings.Split(name, "/")
 	if len(parts) != 2 {

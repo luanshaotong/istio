@@ -273,10 +273,17 @@ func (configgen *ConfigGeneratorImpl) buildGatewayListeners(builder *ListenerBui
 			}
 			gatewaysByListenerName[lname] = gateways
 
+			cfgCache := make(map[string]*config.Config)
+			for _, cfg := range builder.push.GetGateways() {
+				fullName := fmt.Sprintf("%s/%s", cfg.Namespace, cfg.Name)
+				cfgCache[fullName] = &cfg
+			}
+			log.Debugf("buildCfgCache: %v", len(cfgCache))
+
 			var newFilterChains []istionetworking.FilterChain
 			switch transport {
 			case istionetworking.TransportProtocolTCP:
-				newFilterChains = configgen.buildGatewayTCPBasedFilterChains(builder, p, port, opts, serversForPort, proxyConfig, mergedGateway, tlsHostsByPort)
+				newFilterChains = configgen.buildGatewayTCPBasedFilterChains(builder, p, port, opts, serversForPort, proxyConfig, mergedGateway, tlsHostsByPort, cfgCache)
 			case istionetworking.TransportProtocolQUIC:
 				// Currently, we just assume that QUIC is HTTP/3 although that does not
 				// have to be the case (it is just the most common case now, in the future
@@ -362,6 +369,7 @@ func (configgen *ConfigGeneratorImpl) buildGatewayTCPBasedFilterChains(
 	proxyConfig *meshconfig.ProxyConfig,
 	mergedGateway *model.MergedGateway,
 	tlsHostsByPort map[uint32]map[string]string,
+	cfgCache map[string]*config.Config,
 ) []istionetworking.FilterChain {
 	newFilterChains := make([]istionetworking.FilterChain, 0)
 	if p.IsHTTP() {
@@ -384,10 +392,12 @@ func (configgen *ConfigGeneratorImpl) buildGatewayTCPBasedFilterChains(
 		for _, server := range serversForPort.Servers {
 			if gateway.IsHTTPSServerWithTLSTermination(server) {
 				// Added by ingress
-				gatewayConfig := builder.push.GetGatewayByName(mergedGateway.GatewayNameForServer[server])
+				// gatewayConfig := builder.push.GetGatewayByName(mergedGateway.GatewayNameForServer[server])
+				gatewayConfig := cfgCache[mergedGateway.GatewayNameForServer[server]]
 				log.Debugf("[Listener] Get gatewayConfig %v", gatewayConfig)
 				extraOpts := &buildListenerFilterChainExtraOpts{
-					gatewayConfig: builder.push.GetGatewayByName(mergedGateway.GatewayNameForServer[server]),
+					// gatewayConfig: builder.push.GetGatewayByName(mergedGateway.GatewayNameForServer[server]),
+					gatewayConfig: gatewayConfig,
 					meshConfig:    builder.push.Mesh,
 					proxyConfig:   proxyConfig,
 				}
