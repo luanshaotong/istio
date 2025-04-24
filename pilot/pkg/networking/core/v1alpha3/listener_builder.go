@@ -57,6 +57,7 @@ type ListenerBuilder struct {
 	node              *model.Proxy
 	push              *model.PushContext
 	gatewayListeners  []*listener.Listener
+	filterMassageSets [][][]*envoyfilter.MessageIndex // Modified by Sealos
 	inboundListeners  []*listener.Listener
 	outboundListeners []*listener.Listener
 	// HttpProxyListener is a specialize outbound listener. See MeshConfig.proxyHttpPort

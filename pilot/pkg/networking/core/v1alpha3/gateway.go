@@ -361,6 +361,300 @@ func (configgen *ConfigGeneratorImpl) buildGatewayListeners(builder *ListenerBui
 
 // End modified by Higress
 
+// Modified by Sealos
+
+func (ml *MutableGatewayListener) buildExt(builder *ListenerBuilder, opts gatewayListenerOpts) ([][]*envoyfilter.MessageIndex, error) {
+	if len(opts.filterChainOpts) == 0 {
+		return nil, fmt.Errorf("must have more than 0 chains in listener %q", ml.Listener.Name)
+	}
+	httpConnectionManagers := make([][]*envoyfilter.MessageIndex, len(ml.FilterChains))
+	for i := range ml.FilterChains {
+		chain := ml.FilterChains[i]
+		opt := opts.filterChainOpts[i]
+		ml.Listener.FilterChains[i].Metadata = opt.metadata
+		if opt.httpOpts == nil {
+			// we are building a network filter chain (no http connection manager) for this filter chain
+			// In HTTP, we need to have RBAC, etc. upfront so that they can enforce policies immediately
+			// For network filters such as mysql, mongo, etc., we need the filter codec upfront. Data from this
+			// codec is used by RBAC later.
+			//
+			// Currently, when transport is QUIC we assume HTTP3. So it should not come here.
+			// When other protocols are used over QUIC, we have to revisit this assumption.
+
+			if len(opt.networkFilters) > 0 {
+				// this is the terminating filter
+				lastNetworkFilter := opt.networkFilters[len(opt.networkFilters)-1]
+
+				for n := 0; n < len(opt.networkFilters)-1; n++ {
+					ml.Listener.FilterChains[i].Filters = append(ml.Listener.FilterChains[i].Filters, opt.networkFilters[n])
+				}
+				ml.Listener.FilterChains[i].Filters = append(ml.Listener.FilterChains[i].Filters, chain.TCP...)
+				ml.Listener.FilterChains[i].Filters = append(ml.Listener.FilterChains[i].Filters, lastNetworkFilter)
+			} else {
+				ml.Listener.FilterChains[i].Filters = append(ml.Listener.FilterChains[i].Filters, chain.TCP...)
+			}
+			httpConnectionManagers[i] = make([]*envoyfilter.MessageIndex, 0)
+			for j := 0; j < len(ml.Listener.FilterChains[i].Filters); j++ {
+				httpConnectionManagers[i] = append(httpConnectionManagers[i], envoyfilter.NewMessageIndex())
+			}
+			log.Debugf("attached %d network filters to listener %q filter chain %d", len(chain.TCP)+len(opt.networkFilters), ml.Listener.Name, i)
+		} else {
+			// Add the TCP filters first.. and then the HTTP connection manager.
+			// Skip adding this if transport is not TCP (could be QUIC)
+			if chain.TransportProtocol == istionetworking.TransportProtocolTCP {
+				ml.Listener.FilterChains[i].Filters = append(ml.Listener.FilterChains[i].Filters, chain.TCP...)
+			}
+
+			// If statPrefix has been set before calling this method, respect that.
+			if len(opt.httpOpts.statPrefix) == 0 {
+				opt.httpOpts.statPrefix = strings.ToLower(ml.Listener.TrafficDirection.String()) + "_" + ml.Listener.Name
+			}
+			if opts.port != nil {
+				opt.httpOpts.port = opts.port.Port
+			}
+			httpConnectionManager := builder.buildHTTPConnectionManager(opt.httpOpts)
+			filter := &listener.Filter{
+				Name:       wellknown.HTTPConnectionManager,
+				ConfigType: &listener.Filter_TypedConfig{TypedConfig: protoconv.MessageToAny(httpConnectionManager)},
+			}
+			ml.Listener.FilterChains[i].Filters = append(ml.Listener.FilterChains[i].Filters, filter)
+			httpConnectionManagers[i] = make([]*envoyfilter.MessageIndex, len(ml.Listener.FilterChains[i].Filters))
+			httpConnectionManagers[i][len(httpConnectionManagers[i])-1] = envoyfilter.NewMessageIndex()
+			log.Debugf("attached HTTP filter with %d http_filter options to listener %q filter chain %d",
+				len(httpConnectionManager.HttpFilters), ml.Listener.Name, i)
+		}
+	}
+
+	return httpConnectionManagers, nil
+}
+
+func (configgen *ConfigGeneratorImpl) buildGatewayListenersExt(builder *ListenerBuilder, req *model.PushRequest, efKeys []string) (*ListenerBuilder, cacheStats) {
+	listeners := make([]*listener.Listener, 0)
+	http_listeners := make([][][]*envoyfilter.MessageIndex, 0)
+	if builder.node.MergedGateway == nil {
+		log.Debugf("buildGatewayListeners: no gateways for router %v", builder.node.ID)
+		return builder, cacheStats{}
+	}
+
+	mergedGateway := builder.node.MergedGateway
+	log.Debugf("buildGatewayListeners: gateways after merging: %v", mergedGateway)
+
+	actualWildcards, _ := getWildcardsAndLocalHost(builder.node.GetIPMode())
+	errs := istiomultierror.New()
+	// Mutable objects keyed by listener name so that we can build listeners at the end.
+	mutableopts := make(map[string]mutableListenerOpts)
+	proxyConfig := builder.node.Metadata.ProxyConfigOrDefault(builder.push.Mesh.DefaultConfig)
+	// listener port -> host/bind
+	tlsHostsByPort := map[uint32]map[string]string{}
+
+	gatewaysByListenerName := map[string][]*config.Config{}
+	hit, miss := 0, 0
+
+	var listenerWasmPlugins []*config.Config
+	for _, plugins := range req.Push.WasmPlugins(builder.node) {
+		for _, plugin := range plugins {
+			listenerWasmPlugins = append(listenerWasmPlugins, &config.Config{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.WasmPlugin,
+					Name:             plugin.Name,
+					Namespace:        plugin.Namespace,
+				},
+			})
+		}
+	}
+	for _, port := range mergedGateway.ServerPorts {
+		// Skip ports we cannot bind to. Note that MergeGateways will already translate Service port to
+		// targetPort, which handles the common case of exposing ports like 80 and 443 but listening on
+		// higher numbered ports.
+		if builder.node.IsUnprivileged() && port.Number < 1024 {
+			log.Warnf("buildGatewayListeners: skipping privileged gateway port %d for node %s as it is an unprivileged pod",
+				port.Number, builder.node.ID)
+			continue
+		}
+		var extraBind []string
+		bind := actualWildcards[0]
+		if features.EnableDualStack && len(actualWildcards) > 1 {
+			extraBind = actualWildcards[1:]
+		}
+		if len(port.Bind) > 0 {
+			bind = port.Bind
+			extraBind = nil
+		}
+
+		// NOTE: There is no gating here to check for the value of the QUIC feature flag. However,
+		// they are created in MergeGatways only when the flag is set. So when it is turned off, the
+		// MergedQUICTransportServers would be nil so that no listener would be created. It is written this way
+		// to make testing a little easier.
+		transportToServers := map[istionetworking.TransportProtocol]map[model.ServerPort]*model.MergedServers{
+			istionetworking.TransportProtocolTCP:  mergedGateway.MergedServers,
+			istionetworking.TransportProtocolQUIC: mergedGateway.MergedQUICTransportServers,
+		}
+
+		for transport, gwServers := range transportToServers {
+			if gwServers == nil {
+				log.Debugf("buildGatewayListeners: no gateway-server for transport %s at port %d", transport.String(), port.Number)
+				continue
+			}
+
+			needPROXYProtocol := transport != istionetworking.TransportProtocolQUIC &&
+				proxyConfig.GatewayTopology != nil &&
+				proxyConfig.GatewayTopology.ProxyProtocol != nil
+
+			// on a given port, we can either have plain text HTTP servers or
+			// HTTPS/TLS servers with SNI. We cannot have a mix of http and https server on same port.
+			// We can also have QUIC on a given port along with HTTPS/TLS on a given port. It does not
+			// cause port-conflict as they use different transport protocols
+			opts := &gatewayListenerOpts{
+				push:              builder.push,
+				proxy:             builder.node,
+				bind:              bind,
+				extraBind:         extraBind,
+				port:              &model.Port{Port: int(port.Number)},
+				bindToPort:        true,
+				needPROXYProtocol: needPROXYProtocol,
+			}
+			// Added by ingress
+			opts.enableProxyProtocol = builder.push.Mesh.MseIngressGlobalConfig.GetEnableProxyProtocol()
+			// End added by ingress
+			lname := getListenerName(bind, int(port.Number), transport)
+			p := protocol.Parse(port.Protocol)
+			serversForPort := gwServers[port]
+			if serversForPort == nil {
+				continue
+			}
+
+			var gateways []*config.Config
+			for _, s := range serversForPort.Servers {
+				gatewayName := mergedGateway.GatewayNameForServer[s]
+				parts := strings.Split(gatewayName, "/")
+				if len(parts) != 2 {
+					continue
+				}
+				gateways = append(gateways, &config.Config{
+					Meta: config.Meta{
+						GroupVersionKind: gvk.Gateway,
+						Namespace:        parts[0],
+						Name:             parts[1],
+					},
+				})
+			}
+
+			if !features.EnableUnsafeAssertions && features.EnableLDSCaching {
+				listenerCache := &ListenerCache{
+					ListenerName:    lname,
+					Gateways:        gateways,
+					EnvoyFilterKeys: efKeys,
+					WasmPlugins:     listenerWasmPlugins,
+				}
+				cachedResource := configgen.Cache.Get(listenerCache)
+				if cachedResource != nil {
+					cachedListner, err := protoconv.UnmarshalAny[listener.Listener](cachedResource.Resource)
+					if err != nil {
+						errs = multierror.Append(errs, fmt.Errorf("unmarshal lds cache resource to listener %s failed: %v", lname, err))
+						miss++
+						continue
+					}
+					listeners = append(listeners, cachedListner)
+					hit++
+					continue
+				} else {
+					miss++
+				}
+			}
+			gatewaysByListenerName[lname] = gateways
+
+			cfgCache := make(map[string]*config.Config)
+			for _, cfg := range builder.push.GetGateways() {
+				fullName := fmt.Sprintf("%s/%s", cfg.Namespace, cfg.Name)
+				cfgCache[fullName] = &cfg
+			}
+			log.Debugf("buildCfgCache: %v", len(cfgCache))
+
+			var newFilterChains []istionetworking.FilterChain
+			switch transport {
+			case istionetworking.TransportProtocolTCP:
+				newFilterChains = configgen.buildGatewayTCPBasedFilterChains(builder, p, port, opts, serversForPort, proxyConfig, mergedGateway, tlsHostsByPort, cfgCache)
+			case istionetworking.TransportProtocolQUIC:
+				// Currently, we just assume that QUIC is HTTP/3 although that does not
+				// have to be the case (it is just the most common case now, in the future
+				// we will support more cases)
+				newFilterChains = configgen.buildGatewayHTTP3FilterChains(builder, serversForPort, mergedGateway, proxyConfig, opts)
+			}
+
+			for cnum := range newFilterChains {
+				// update by ingress
+				if util.IsIstioVersionGE117(builder.node.IstioVersion) && alifeatures.EnableLDSAuthnFilter {
+					newFilterChains[cnum].TCP = append(newFilterChains[cnum].TCP, xdsfilters.IstioNetworkAuthenticationFilter)
+				}
+				if newFilterChains[cnum].ListenerProtocol == istionetworking.ListenerProtocolTCP {
+					newFilterChains[cnum].TCP = append(newFilterChains[cnum].TCP, builder.authzCustomBuilder.BuildTCP()...)
+					newFilterChains[cnum].TCP = append(newFilterChains[cnum].TCP, builder.authzBuilder.BuildTCP()...)
+				}
+			}
+
+			if mopts, exists := mutableopts[lname]; !exists {
+				mutable := &MutableGatewayListener{
+					MutableObjects: istionetworking.MutableObjects{
+						// Note: buildGatewayListener creates filter chains but does not populate the filters in the chain; that's what
+						// this is for.
+						FilterChains: newFilterChains,
+					},
+				}
+				mutableopts[lname] = mutableListenerOpts{mutable: mutable, opts: opts, transport: transport}
+			} else {
+				mopts.opts.filterChainOpts = append(mopts.opts.filterChainOpts, opts.filterChainOpts...)
+				mopts.mutable.MutableObjects.FilterChains = append(mopts.mutable.MutableObjects.FilterChains, newFilterChains...)
+			}
+		}
+	}
+	for _, ml := range mutableopts {
+		ml.mutable.Listener = buildGatewayListener(*ml.opts, ml.transport)
+		log.Debugf("buildGatewayListeners: marshaling listener %q with %d filter chains",
+			ml.mutable.Listener.GetName(), len(ml.mutable.Listener.GetFilterChains()))
+
+		// Filters are serialized one time into an opaque struct once we have the complete list.
+		var http_listener [][]*envoyfilter.MessageIndex
+		var err error
+		if http_listener, err = ml.mutable.buildExt(builder, *ml.opts); err != nil {
+			errs = multierror.Append(errs, fmt.Errorf("gateway omitting listener %q due to: %v", ml.mutable.Listener.Name, err.Error()))
+			continue
+		}
+		listeners = append(listeners, ml.mutable.Listener)
+		http_listeners = append(http_listeners, http_listener)
+
+		if features.EnableLDSCaching {
+			listenerCache := &ListenerCache{
+				ListenerName:    ml.mutable.Listener.Name,
+				Gateways:        gatewaysByListenerName[ml.mutable.Listener.Name],
+				EnvoyFilterKeys: efKeys,
+				WasmPlugins:     listenerWasmPlugins,
+			}
+			resource := &discovery.Resource{
+				Name:     ml.mutable.Listener.Name,
+				Resource: protoconv.MessageToAny(ml.mutable.Listener),
+			}
+			configgen.Cache.Add(listenerCache, req, resource)
+		}
+	}
+	// We'll try to return any listeners we successfully marshaled; if we have none, we'll emit the error we built up
+	err := errs.ErrorOrNil()
+	if err != nil {
+		// we have some listeners to return, but we also have some errors; log them
+		log.Info(err.Error())
+	}
+
+	if len(mutableopts) == 0 && len(listeners) == 0 {
+		log.Warnf("gateway has zero listeners for node %v", builder.node.ID)
+		return builder, cacheStats{}
+	}
+
+	builder.gatewayListeners = listeners
+	builder.filterMassageSets = http_listeners
+	return builder, cacheStats{hits: hit, miss: miss}
+}
+
+// End modified by Sealos
+
 func (configgen *ConfigGeneratorImpl) buildGatewayTCPBasedFilterChains(
 	builder *ListenerBuilder,
 	p protocol.Instance, port model.ServerPort,
