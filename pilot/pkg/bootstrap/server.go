@@ -1200,7 +1200,7 @@ func (s *Server) startCA(caOpts *caOptions) {
 			s.RunCA(grpcServer, s.RA, caOpts)
 		} else if s.CA != nil {
 			log.Infof("Starting IstioD CA")
-			log.Infof("Build with cfg cache")
+			log.Infof("Build flag 250427v1")
 			s.RunCA(grpcServer, s.CA, caOpts)
 		}
 		return nil
