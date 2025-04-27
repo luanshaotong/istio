@@ -143,6 +143,51 @@ func (configgen *ConfigGeneratorImpl) BuildListeners(node *model.Proxy,
 
 // End modified by Higress
 
+func (configgen *ConfigGeneratorImpl) BuildListenersExt(node *model.Proxy,
+	req *model.PushRequest,
+) ([]*listener.Listener, model.XdsLogDetails) {
+	builder := NewListenerBuilder(node, req.Push)
+	cacheStats := cacheStats{}
+	efw := req.Push.EnvoyFilters(node)
+	efKeys := efw.Keys()
+
+	switch node.Type {
+	case model.SidecarProxy:
+		builder = configgen.buildSidecarListeners(builder)
+	case model.Waypoint:
+		builder = configgen.buildWaypointListeners(builder)
+	case model.Router:
+		builder, cacheStats = configgen.buildGatewayListeners(builder, req, efKeys)
+	}
+
+	var l []*listener.Listener
+	// Because the EnvoyFilter still needs to be patched before the final LDS data is generated,
+	// it is determined here that as long as all LDS caches are hit, the cached listeners will be
+	// used to avoid repeatedly patching the EnvoyFilter.
+	var useCached bool
+	if !cacheStats.empty() && cacheStats.miss == 0 {
+		node.RLock()
+		if len(node.CachedListeners) > 0 {
+			l = node.CachedListeners
+			useCached = true
+			log.Debugf("node %s use cached listeners: %+v", node.ID, node.CachedListeners)
+		}
+		node.RUnlock()
+	}
+	if !useCached {
+		builder.patchListenersExt()
+		l = builder.getListeners()
+		if builder.node.EnableHBONE() && !builder.node.IsAmbient() {
+			l = append(l, buildConnectOriginateListener())
+		}
+		node.Lock()
+		node.CachedListeners = l
+		log.Debugf("node %s cached listeners: %+v", node.ID, node.CachedListeners)
+		node.Unlock()
+	}
+	return l, model.XdsLogDetails{AdditionalInfo: fmt.Sprintf("cached:%v/%v", cacheStats.hits, cacheStats.hits+cacheStats.miss)}
+}
+
 func BuildListenerTLSContext(serverTLSSettings *networking.ServerTLSSettings,
 	proxy *model.Proxy, mesh *meshconfig.MeshConfig, transportProtocol istionetworking.TransportProtocol, gatewayTCPServerWithTerminatingTLS bool,
 	extraOpts *buildListenerFilterChainExtraOpts,

@@ -173,12 +173,32 @@ func (lb *ListenerBuilder) patchOneListener(l *listener.Listener, ctx networking
 	return tempArray[0]
 }
 
-func (lb *ListenerBuilder) patchListeners() {
+func (lb *ListenerBuilder) patchListenersExt() {
 	lb.envoyFilterWrapper = lb.push.EnvoyFilters(lb.node)
 	if lb.envoyFilterWrapper == nil {
 		return
 	}
 
+	userMgrs := envoyfilter.MakeMessageIndexForPatch(lb.envoyFilterWrapper.Patches)
+
+	if lb.node.Type == model.Router {
+		lb.gatewayListeners = envoyfilter.ApplyListenerPatchesExt(networking.EnvoyFilter_GATEWAY, lb.envoyFilterWrapper,
+			lb.gatewayListeners, false, lb.filterMassageSets, userMgrs)
+		return
+	}
+
+	lb.virtualOutboundListener = lb.patchOneListener(lb.virtualOutboundListener, networking.EnvoyFilter_SIDECAR_OUTBOUND)
+	lb.virtualInboundListener = lb.patchOneListener(lb.virtualInboundListener, networking.EnvoyFilter_SIDECAR_INBOUND)
+	lb.httpProxyListener = lb.patchOneListener(lb.httpProxyListener, networking.EnvoyFilter_SIDECAR_OUTBOUND)
+	lb.inboundListeners = envoyfilter.ApplyListenerPatches(networking.EnvoyFilter_SIDECAR_INBOUND, lb.envoyFilterWrapper, lb.inboundListeners, false)
+	lb.outboundListeners = envoyfilter.ApplyListenerPatches(networking.EnvoyFilter_SIDECAR_OUTBOUND, lb.envoyFilterWrapper, lb.outboundListeners, false)
+}
+
+func (lb *ListenerBuilder) patchListeners() {
+	lb.envoyFilterWrapper = lb.push.EnvoyFilters(lb.node)
+	if lb.envoyFilterWrapper == nil {
+		return
+	}
 	if lb.node.Type == model.Router {
 		lb.gatewayListeners = envoyfilter.ApplyListenerPatches(networking.EnvoyFilter_GATEWAY, lb.envoyFilterWrapper,
 			lb.gatewayListeners, false)
