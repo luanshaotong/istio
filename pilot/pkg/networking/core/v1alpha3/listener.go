@@ -157,7 +157,7 @@ func (configgen *ConfigGeneratorImpl) BuildListenersExt(node *model.Proxy,
 	case model.Waypoint:
 		builder = configgen.buildWaypointListeners(builder)
 	case model.Router:
-		builder, cacheStats = configgen.buildGatewayListeners(builder, req, efKeys)
+		builder, cacheStats = configgen.buildGatewayListenersExt(builder, req, efKeys)
 	}
 
 	var l []*listener.Listener

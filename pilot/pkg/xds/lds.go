@@ -15,8 +15,6 @@
 package xds
 
 import (
-	"bytes"
-
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 
 	"istio.io/istio/pilot/pkg/model"
@@ -97,26 +95,26 @@ func (l LdsGenerator) Generate(proxy *model.Proxy, _ *model.WatchedResource, req
 	}
 	resources := model.Resources{}
 	// Modified by Higress
-	listeners, logs := l.Server.ConfigGenerator.BuildListeners(proxy, req)
-	listenersExt, _ := l.Server.ConfigGenerator.BuildListenersExt(proxy, req)
-	for i, c := range listeners {
-		if i >= len(listenersExt) {
-			log.Warnf("listenersExt is not enough, i: %d, len(listenersExt): %d", i, len(listenersExt))
-		}
+	listeners, logs := l.Server.ConfigGenerator.BuildListenersExt(proxy, req)
+	// listenersExt, _ := l.Server.ConfigGenerator.BuildListenersExt(proxy, req)
+	for _, c := range listeners {
+		// if i >= len(listenersExt) {
+		// 	log.Warnf("listenersExt is not enough, i: %d, len(listenersExt): %d", i, len(listenersExt))
+		// }
 		res := protoconv.MessageToAny(c)
-		resExt := protoconv.MessageToAny(listenersExt[i])
-		if res == nil {
-			log.Warnf("failed to convert listener to any, listener: %v", c)
-			continue
-		}
-		if resExt == nil {
-			log.Warnf("failed to convert listenerExt to any, listenerExt: %v", listenersExt[i])
-			continue
-		}
+		// resExt := protoconv.MessageToAny(listenersExt[i])
+		// if res == nil {
+		// 	log.Warnf("failed to convert listener to any, listener: %v", c)
+		// 	continue
+		// }
+		// if resExt == nil {
+		// 	log.Warnf("failed to convert listenerExt to any, listenerExt: %v", listenersExt[i])
+		// 	continue
+		// }
 		// check if res equals resExt
-		if res.TypeUrl != resExt.TypeUrl || bytes.Equal(res.Value, resExt.Value) == false {
-			log.Warnf("res != resExt, res: %v, resExt: %v", res, resExt)
-		}
+		// if res.TypeUrl != resExt.TypeUrl || bytes.Equal(res.Value, resExt.Value) == false {
+		// 	log.Warnf("res != resExt, res: %v, resExt: %v", res, resExt)
+		// }
 		resources = append(resources, &discovery.Resource{
 			Name:     c.Name,
 			Resource: res,
