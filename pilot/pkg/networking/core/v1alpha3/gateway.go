@@ -614,7 +614,7 @@ func (configgen *ConfigGeneratorImpl) buildHostRDSConfig(
 	node *model.Proxy,
 	req *model.PushRequest,
 	routeName string,
-	vsCache map[int][]virtualServiceContext,
+	vsCacheIndexedByPortAndHost map[uint32]map[string][]virtualServiceContext,
 	efw *model.EnvoyFilterWrapper,
 	efKeys []string,
 ) (*discovery.Resource, bool) {
@@ -743,66 +743,12 @@ func (configgen *ConfigGeneratorImpl) buildHostRDSConfig(
 		}
 	}
 	gatewayRoutes := make(map[string]map[string][]*route.Route)
-	gatewayVirtualServices := make(map[string][]config.Config)
-	var listenerVirtualServices []virtualServiceContext
 	var selectedVirtualServices []virtualServiceContext
 	var vHost *route.VirtualHost
-	serverIterator := func(mergedServers map[model.ServerPort]*model.MergedServers) {
-		for port, servers := range mergedServers {
-			if port.Number != listenerPort {
-				continue
-			}
-			for _, server := range servers.Servers {
-				gatewayName := merged.GatewayNameForServer[server]
-
-				var virtualServices []config.Config
-				var exists bool
-
-				if virtualServices, exists = gatewayVirtualServices[gatewayName]; !exists {
-					virtualServices = push.VirtualServicesForGateway(node.ConfigNamespace, gatewayName)
-					gatewayVirtualServices[gatewayName] = virtualServices
-				}
-				for _, virtualService := range virtualServices {
-					virtualServiceHosts := host.NewNames(virtualService.Spec.(*networking.VirtualService).Hosts)
-					serverHosts := host.NamesForNamespace(server.Hosts, virtualService.Namespace)
-
-					// We have two cases here:
-					// 1. virtualService hosts are 1.foo.com, 2.foo.com, 3.foo.com and server hosts are ns/*.foo.com
-					// 2. virtualService hosts are *.foo.com, and server hosts are ns/1.foo.com, ns/2.foo.com, ns/3.foo.com
-					intersectingHosts := serverHosts.Intersection(virtualServiceHosts)
-					if len(intersectingHosts) == 0 {
-						continue
-					}
-					listenerVirtualServices = append(listenerVirtualServices, virtualServiceContext{
-						virtualService:    virtualService,
-						server:            server,
-						gatewayName:       gatewayName,
-						intersectingHosts: intersectingHosts,
-					})
-				}
-			}
+	if vsCacheIndexedByHost, ok := vsCacheIndexedByPortAndHost[listenerPort]; ok {
+		if vsCtxs, ok := vsCacheIndexedByHost[hostRDSHost]; ok {
+			selectedVirtualServices = append(selectedVirtualServices, vsCtxs...)
 		}
-	}
-	var vsExists bool
-	if listenerVirtualServices, vsExists = vsCache[rdsPort]; !vsExists {
-		serverIterator(merged.MergedServers)
-		serverIterator(merged.MergedQUICTransportServers)
-		vsCache[rdsPort] = listenerVirtualServices
-	}
-	for _, vsCtx := range listenerVirtualServices {
-		virtualService := vsCtx.virtualService.Spec.(*networking.VirtualService)
-		hostMatch := false
-		for _, hostname := range virtualService.Hosts {
-			// exact match
-			if hostname == hostRDSHost {
-				hostMatch = true
-				break
-			}
-		}
-		if !hostMatch {
-			continue
-		}
-		selectedVirtualServices = append(selectedVirtualServices, vsCtx)
 	}
 	sort.SliceStable(selectedVirtualServices, func(i, j int) bool {
 		// Sort by creationTimestamp after
@@ -970,10 +916,11 @@ func (configgen *ConfigGeneratorImpl) buildGatewayHTTPRouteConfig(
 	node *model.Proxy,
 	req *model.PushRequest,
 	routeName string,
-	vsCache map[int][]virtualServiceContext,
+	vsCacheIndexedByPortAndHost map[uint32]map[string][]virtualServiceContext,
 	efw *model.EnvoyFilterWrapper,
 	efKeys []string,
 ) (*discovery.Resource, bool) {
+	defer trackTime("buildGatewayHTTPRouteConfig")()
 	if node.MergedGateway == nil {
 		log.Warnf("buildGatewayRoutes: no gateways for router %v", node.ID)
 		return nil, false
@@ -981,7 +928,7 @@ func (configgen *ConfigGeneratorImpl) buildGatewayHTTPRouteConfig(
 	// Added by ingress
 	push := req.Push
 	if strings.HasPrefix(routeName, constants.HigressHostRDSNamePrefix) {
-		resource, cacheHit := configgen.buildHostRDSConfig(node, req, routeName, vsCache, efw, efKeys)
+		resource, cacheHit := configgen.buildHostRDSConfig(node, req, routeName, vsCacheIndexedByPortAndHost, efw, efKeys)
 		if resource == nil {
 			return nil, false
 		}

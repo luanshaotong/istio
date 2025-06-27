@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	statefulsession "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/stateful_session/v3"
@@ -44,6 +45,7 @@ import (
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/protocol"
+	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/proto"
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/sets"
@@ -52,6 +54,10 @@ import (
 const (
 	wildcardDomainPrefix     = "*."
 	inboundVirtualHostPrefix = string(model.TrafficDirectionInbound) + "|http|"
+)
+
+var (
+	httprouteLog = log.RegisterScope("httproute", "httproute debugging")
 )
 
 // BuildHTTPRoutes produces a list of routes for the proxy
@@ -95,10 +101,14 @@ func (configgen *ConfigGeneratorImpl) BuildHTTPRoutes(
 		}
 	case model.Router:
 		// Modified by ingress
-		vsCache := make(map[int][]virtualServiceContext)
+		vsCacheIndexedByPortAndHost := make(map[uint32]map[string][]virtualServiceContext)
 		envoyfilterKeys := efw.Keys()
+		if err := buildVsCache(node, req.Push, vsCacheIndexedByPortAndHost); err != nil {
+			return routeConfigurations, model.XdsLogDetails{AdditionalInfo: fmt.Sprintf("unable to build gateway http route config since we couldn't build the cache first: %v", err)}
+		}
+		httprouteLog.Infof("Build %v routeNames for node %v", len(routeNames), node.ID)
 		for _, routeName := range routeNames {
-			rc, cached := configgen.buildGatewayHTTPRouteConfig(node, req, routeName, vsCache, efw, envoyfilterKeys)
+			rc, cached := configgen.buildGatewayHTTPRouteConfig(node, req, routeName, vsCacheIndexedByPortAndHost, efw, envoyfilterKeys)
 			if cached && !features.EnableUnsafeAssertions {
 				hit++
 			} else {
@@ -123,6 +133,89 @@ func (configgen *ConfigGeneratorImpl) BuildHTTPRoutes(
 		return routeConfigurations, model.DefaultXdsLogDetails
 	}
 	return routeConfigurations, model.XdsLogDetails{AdditionalInfo: fmt.Sprintf("cached:%v/%v", hit, hit+miss)}
+}
+
+func trackTime(name string) func() {
+	start := time.Now()
+	return func() {
+		httprouteLog.Debugf("%s took %v", name, time.Since(start))
+	}
+}
+
+func buildListenerPorts(routeNames []string) (map[uint32]struct{}, error) {
+	defer trackTime("buildListenerPorts")()
+	listenerPorts := make(map[uint32]struct{})
+	for _, routeName := range routeNames {
+		portAndHost := strings.SplitN(strings.TrimPrefix(routeName, constants.HigressHostRDSNamePrefix), ".", 2)
+		if len(portAndHost) != 2 {
+			log.Errorf("Invalid route %s when using Higress hostRDS", routeName)
+			continue
+		}
+		port, err := strconv.ParseUint(portAndHost[0], 0, 32)
+		if err != nil {
+			log.Errorf("Invalid port %s of route %s when using Higress hostRDS", portAndHost[0], routeName)
+			continue
+		}
+		listenerPorts[uint32(port)] = struct{}{}
+	}
+	return listenerPorts, nil
+}
+
+func buildVsCache(node *model.Proxy, push *model.PushContext, vsCacheIndexedByPortAndHost map[uint32]map[string][]virtualServiceContext) error {
+	defer trackTime("buildVsCache")()
+	if vsCacheIndexedByPortAndHost == nil {
+		// this map should be passed by the caller
+		return nil
+	}
+	gatewayVirtualServices := make(map[string][]config.Config)
+	merged := node.MergedGateway
+	serverIterator := func(mergedServers map[model.ServerPort]*model.MergedServers) {
+		for port, servers := range mergedServers {
+			for _, server := range servers.Servers {
+				gatewayName := merged.GatewayNameForServer[server]
+
+				var virtualServices []config.Config
+				var exists bool
+
+				if virtualServices, exists = gatewayVirtualServices[gatewayName]; !exists {
+					virtualServices = push.VirtualServicesForGateway(node.ConfigNamespace, gatewayName)
+					gatewayVirtualServices[gatewayName] = virtualServices
+				}
+				for _, virtualService := range virtualServices {
+					virtualServiceHosts := host.NewNames(virtualService.Spec.(*networking.VirtualService).Hosts)
+					serverHosts := host.NamesForNamespace(server.Hosts, virtualService.Namespace)
+
+					// We have two cases here:
+					// 1. virtualService hosts are 1.foo.com, 2.foo.com, 3.foo.com and server hosts are ns/*.foo.com
+					// 2. virtualService hosts are *.foo.com, and server hosts are ns/1.foo.com, ns/2.foo.com, ns/3.foo.com
+					intersectingHosts := serverHosts.Intersection(virtualServiceHosts)
+					if len(intersectingHosts) == 0 {
+						continue
+					}
+					vsSpec := virtualService.Spec.(*networking.VirtualService)
+					for _, hostname := range vsSpec.Hosts {
+						if _, ok := vsCacheIndexedByPortAndHost[port.Number]; !ok {
+							vsCacheIndexedByPortAndHost[port.Number] = make(map[string][]virtualServiceContext)
+						}
+						if _, ok := vsCacheIndexedByPortAndHost[port.Number][hostname]; !ok {
+							vsCacheIndexedByPortAndHost[port.Number][hostname] = make([]virtualServiceContext, 0)
+						}
+						virtualServiceContexts := vsCacheIndexedByPortAndHost[port.Number][hostname]
+						virtualServiceContexts = append(virtualServiceContexts, virtualServiceContext{
+							virtualService:    virtualService,
+							server:            server,
+							gatewayName:       gatewayName,
+							intersectingHosts: intersectingHosts,
+						})
+						vsCacheIndexedByPortAndHost[port.Number][hostname] = virtualServiceContexts
+					}
+				}
+			}
+		}
+	}
+	serverIterator(merged.MergedServers)
+	serverIterator(merged.MergedQUICTransportServers)
+	return nil
 }
 
 // buildSidecarInboundHTTPRouteConfig builds the route config with a single wildcard virtual host on the inbound path

@@ -632,7 +632,10 @@ func (p *XdsProxy) initDownstreamServer() error {
 	}
 	// TODO: Expose keepalive options to agent cmd line flags.
 	opts := p.downstreamGrpcOptions
-	opts = append(opts, istiogrpc.ServerOptions(istiokeepalive.DefaultOption())...)
+	customOpts := istiokeepalive.DefaultOption()
+	customOpts.Time = 3 * time.Minute
+	customOpts.Timeout = 60 * time.Second
+	opts = append(opts, istiogrpc.ServerOptions(customOpts)...)
 	grpcs := grpc.NewServer(opts...)
 	discovery.RegisterAggregatedDiscoveryServiceServer(grpcs, p)
 	reflection.Register(grpcs)
